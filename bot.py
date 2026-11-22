@@ -290,6 +290,7 @@ class Bot:
         return best
 
     def hold_goal(self, obs, me, t):
+        return None  # v5: corner holding off (v4 scored lower)
         zn = obs["zone"]
         ok = self.hold is not None and \
             math.hypot(self.hold[0] - zn["next_center"][0], self.hold[1] - zn["next_center"][1]) < zn["next_radius"] * 0.75 \
