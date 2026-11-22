@@ -157,11 +157,11 @@ UPGRADE_PRIORITY = [
     "capacitor", "gun_mag", "jets", "lightning_chain", "sensors", "laser_pierce",
     "mortar_reload", "mortar_velocity", "mortar_splash",
 ]
-WANT_WEAPON = {"laser": 3, "lightning": 2}
+WANT_WEAPON = {"lightning": 3, "laser": 2}
 
 
 class Bot:
-    name = "FarmerOne"
+    name = "FarmerOne-BERSERK"
 
     def __init__(self, hello):
         cfg = hello["config"]
@@ -308,6 +308,7 @@ class Bot:
         return best
 
     def pick_roof(self, obs, me):
+        return None  # v7: no camping, all aggression
         if not self.map.ok:
             return None
         x, y, z = me["pos"]
@@ -437,7 +438,7 @@ class Bot:
             ay, ap = me["aim"]
             return abs(wrap(ay - yaw)) * max(d, 1) < tol and abs(ap - pitch) * max(d, 1) < tol + 1.5
 
-        def gun_shoot(m, d, tol=2.0):
+        def gun_shoot(m, d, tol=3.2):
             nonlocal aim
             if gun is None:
                 return
@@ -507,16 +508,16 @@ class Bot:
             elif m.get("hp", 1400) < me["hp"] * 0.8:
                 pref = min(pref, 55.0)  # winning a 1v1: press in and finish it
             e_hp = m.get("hp", 1400)
-            if n_vis <= 1:
-                retreat = hp_frac < 0.25 or (hp_frac < 0.45 and e_hp > me["hp"] * 1.8)
-            else:
-                retreat = hp_frac < 0.5 or (hp_frac < 0.7 and n_vis >= 3)
+            pref = 28.0 if light_i is not None else 40.0
+            if n_vis >= 3:
+                pref = 55.0
+            retreat = hp_frac < 0.15
             if retreat:
                 pref = 200.0
                 mode = "retreat"
             if t > self.strafe_until:
                 self.strafe_sign = random.choice((-1, 1))
-                self.strafe_until = t + random.uniform(0.5, 1.3)
+                self.strafe_until = t + random.uniform(0.25, 0.6)
             sx, sy = -math.sin(bear) * self.strafe_sign, math.cos(bear) * self.strafe_sign
             radial = max(-1.0, min(1.0, (d - pref) / 30.0))
             mx = sx * 0.85 + math.cos(bear) * radial * 0.8
@@ -551,14 +552,18 @@ class Bot:
                         move = (sx * 0.3, sy * 0.3)
                     mode = "cover"
             laser_charging = laser_i is not None and (weapons[laser_i].get("charge", 0) or 0) > 0
-            boost = (energy > 55 or (retreat and energy > 15)) and not laser_charging
-            if light_i is not None and d < 50 and not retreat:
-                boost = boost and energy > 70
+            boost = energy > (35 if light_i is not None else 8) and not laser_charging
+            if me["grounded"] and random.random() < 0.08:
+                jump = True  # hop now and then: harder to hit
 
         # threats we cannot see but heard / got hit by
         if not target and self.look_bearing is not None and t < self.look_until:
             aim = [self.look_bearing, 0.05]
             mode = "alert"
+            if hp_frac > 0.3:
+                move = (math.cos(self.look_bearing), math.sin(self.look_bearing))
+                boost = energy > 30
+                mode = "hunt"
 
         # ---------- non-mech shooting (npcs, crates) ----------
         if not target:
