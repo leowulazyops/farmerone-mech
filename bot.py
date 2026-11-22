@@ -165,6 +165,8 @@ class Bot:
         self.prev_hp = None
         self.cover = None
         self.cover_t = -99.0
+        self.hold = None
+        self.hold_t = -99.0
 
     # ---------- helpers ----------
     def zone_goal(self, obs, me):
@@ -241,6 +243,65 @@ class Bot:
         if best and best[2] > 0:
             return best[:2]
         return None
+
+    def find_hold(self, obs, me):
+        """A corner spot near the zone's next circle: walls on some sides, open on others."""
+        if not self.map.ok:
+            return None
+        x, y, z = me["pos"]
+        zn = obs["zone"]
+        ncx, ncy = zn["next_center"]
+        nr = zn["next_radius"]
+        best, best_s = None, -1e9
+        rng = random.Random(int(obs["t"] * 10))
+        for _ in range(70):
+            # half near us, half near the next circle's middle
+            if rng.random() < 0.5:
+                a, r = rng.uniform(0, TAU), rng.uniform(5, 90)
+                px, py = x + math.cos(a) * r, y + math.sin(a) * r
+            else:
+                a, r = rng.uniform(0, TAU), rng.uniform(0, nr * 0.6)
+                px, py = ncx + math.cos(a) * r, ncy + math.sin(a) * r
+            if math.hypot(px - ncx, py - ncy) > nr * 0.7 or not self.inside_safe(obs, px, py, 20):
+                continue
+            gz = self.map.h(px, py)
+            if abs(gz - z) > 6:
+                continue
+            blocked, opens = 0, []
+            for k in range(16):
+                a = k * TAU / 16
+                c, s = math.cos(a), math.sin(a)
+                hit = False
+                for d in (3.0, 5.0, 7.5, 10.0):
+                    if self.map.h(px + c * d, py + s * d) > gz + 6:
+                        hit = True
+                        break
+                if hit:
+                    blocked += 1
+                else:
+                    opens.append(a)
+            if blocked < 3 or blocked > 10:
+                continue
+            s_ = -abs(blocked - 6) * 8 - math.hypot(px - x, py - y) * 0.35 - math.hypot(px - ncx, py - ncy) * 0.1
+            if s_ > best_s:
+                ox = sum(math.cos(a) for a in opens)
+                oy = sum(math.sin(a) for a in opens)
+                best, best_s = (px, py, math.atan2(oy, ox)), s_
+        return best
+
+    def hold_goal(self, obs, me, t):
+        zn = obs["zone"]
+        ok = self.hold is not None and \
+            math.hypot(self.hold[0] - zn["next_center"][0], self.hold[1] - zn["next_center"][1]) < zn["next_radius"] * 0.75 \
+            and self.inside_safe(obs, self.hold[0], self.hold[1], 15)
+        if not ok or (t - self.hold_t > 40 and math.hypot(self.hold[0] - me["pos"][0], self.hold[1] - me["pos"][1]) > 30):
+            if t - self.hold_t > 3.0 or not ok:
+                if t - self.hold_t > 1.0:
+                    self.hold = self.find_hold(obs, me)
+                    self.hold_t = t
+        if self.hold is None:
+            return None
+        return (self.hold[0], self.hold[1])
 
     def inside_safe(self, obs, px, py, margin=10):
         z = obs["zone"]
@@ -422,6 +483,15 @@ class Bot:
                 mx += ax * w
                 my += ay * w
             move = norm2(mx, my)
+            if self.hold is not None and not retreat and len(threats) <= 2:
+                hx, hy = self.hold[0] - x, self.hold[1] - y
+                hd = math.hypot(hx, hy)
+                if hd < 25:
+                    # peek around our corner: small side steps, pulled back to the spot
+                    ux, uy = norm2(hx, hy)
+                    pull = min(1.0, hd / 6.0)
+                    move = norm2(sx * 0.6 + ux * pull * 1.2, sy * 0.6 + uy * pull * 1.2)
+                    mode = "hold-fight"
             if retreat:
                 if t - self.cover_t > 0.6:
                     self.cover = self.find_cover(obs, me, threats)
@@ -477,7 +547,7 @@ class Bot:
 
         # ---------- movement goals out of combat ----------
         zgoal, zurgent = self.zone_goal(obs, me)
-        if mode != "fight" and mode != "retreat":
+        if not mode.startswith(("fight", "retreat", "cover", "hold-fight")):
             goal = None
             # supply drop
             for dr in obs.get("drops", []):
@@ -528,33 +598,16 @@ class Bot:
                 if best:
                     goal = (best[0]["pos"][0], best[0]["pos"][1])
                     mode = "cube"
-            # farm cubes: walk toward drones and crates we can see
-            if goal is None and hp_frac > 0.6 and not zurgent:
-                best = None
-                for n in npcs:
-                    if abs(n["pos"][2] - z) > 6 or not self.inside_safe(obs, n["pos"][0], n["pos"][1], 25):
-                        continue
-                    d = dist(n)
-                    if d < 200 and (best is None or d < best[1]):
-                        best = (n, d)
-                if best and best[1] > 55:
-                    goal = (best[0]["pos"][0], best[0]["pos"][1])
-                    mode = "hunt"
-                elif best is None:
-                    for c_ in obs.get("crates", []):
-                        if abs(c_["pos"][2] - z) > 5 or not self.inside_safe(obs, c_["pos"][0], c_["pos"][1], 25):
-                            continue
-                        d = math.hypot(c_["pos"][0] - x, c_["pos"][1] - y)
-                        if 30 < d < 160 and (best is None or d < best[1]):
-                            best = (c_, d)
-                    if best:
-                        goal = (best[0]["pos"][0], best[0]["pos"][1])
-                        mode = "crate"
             if zurgent and zgoal:
                 goal = zgoal
                 mode = "zone"
             if goal is None:
-                if zgoal:
+                # hold a corner near the next circle: silent, shoot first
+                hold_goal = self.hold_goal(obs, me, t)
+                if hold_goal is not None:
+                    goal = hold_goal
+                    mode = "hold"
+                elif zgoal:
                     goal = zgoal
                 else:
                     zc = obs["zone"]["next_center"]
@@ -562,10 +615,13 @@ class Bot:
                         goal = (zc[0], zc[1])
             if goal is not None:
                 gx, gy = goal[0] - x, goal[1] - y
-                if math.hypot(gx, gy) > 2.0:
+                gd = math.hypot(gx, gy)
+                if gd > 2.0:
                     move = norm2(gx, gy)
-                    if math.hypot(gx, gy) < 6:
-                        move = (move[0] * 0.5, move[1] * 0.5)
+                    if gd < 6 or (mode == "hold" and gd < 25):
+                        move = (move[0] * 0.4, move[1] * 0.4)  # under step speed: silent
+                if mode == "hold" and gd < 3.0:
+                    move = (0.0, 0.0)
             # low hp and nobody around: walk slowly (silent) to regen
             if hp_frac < 0.65 and mode in ("roam", "crate") and not zurgent and t - self.last_dmg_t > 2.0:
                 move = (0.0, 0.0)  # stand still: silent, and regen kicks in
@@ -578,7 +634,7 @@ class Bot:
                 boost = boost or (not me["in_zone"] and energy > 10)
 
         # cubes close by: grab them even mid-fight
-        if mode in ("fight",):
+        if mode in ("fight", "hold-fight"):
             reach_c = 35 if (len(threats) == 1 and hp_frac > 0.5) else 18
             for c_ in obs.get("cubes", []):
                 d = math.hypot(c_["pos"][0] - x, c_["pos"][1] - y)
@@ -671,6 +727,8 @@ class Bot:
                 aim = [s["bearing"], 0.05]
             elif self.look_bearing is not None and t < self.look_until:
                 aim = [self.look_bearing, 0.05]
+            elif self.hold is not None and math.hypot(self.hold[0] - x, self.hold[1] - y) < 8:
+                aim = [wrap(self.hold[2] + 0.9 * math.sin(t * 0.9)), 0.0]
             else:
                 base = math.atan2(my, mx) if moving else me["aim"][0]
                 aim = [wrap(base + 1.0 * math.sin(t * 1.3)), 0.0]
