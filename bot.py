@@ -102,6 +102,22 @@ class Map:
                     if top > surf[k]:
                         surf[k] = top
         self.surf = surf
+        # roof spots: flat tops 8 m+ above ground, 4 m in from every edge
+        roofs = []
+        for j in range(3, ny - 3, 3):
+            for i in range(3, nx - 3, 3):
+                k = j * nx + i
+                top = surf[k]
+                if top - ground[k] < 8:
+                    continue
+                flat = True
+                for dj in (-2, 0, 2):
+                    for di in (-2, 0, 2):
+                        if abs(surf[(j + dj) * nx + i + di] - top) > 0.8:
+                            flat = False
+                if flat:
+                    roofs.append((self.minx + (i + 0.5) * CELL, self.miny + (j + 0.5) * CELL, top, top - ground[k]))
+        self.roofs = roofs
 
     def h(self, x, y):
         if not self.ok:
@@ -167,6 +183,8 @@ class Bot:
         self.cover_t = -99.0
         self.hold = None
         self.hold_t = -99.0
+        self.roof = None
+        self.roof_t = -99.0
 
     # ---------- helpers ----------
     def zone_goal(self, obs, me):
@@ -288,6 +306,34 @@ class Bot:
                 oy = sum(math.sin(a) for a in opens)
                 best, best_s = (px, py, math.atan2(oy, ox)), s_
         return best
+
+    def pick_roof(self, obs, me):
+        if not self.map.ok:
+            return None
+        x, y, z = me["pos"]
+        zn = obs["zone"]
+        ncx, ncy = zn["next_center"]
+        nr = zn["next_radius"]
+        best, best_s = None, -1e9
+        for (rx, ry, top, ht) in self.map.roofs:
+            d = math.hypot(rx - x, ry - y)
+            if d > 170:
+                continue
+            if top - z > 45:  # must be climbable on one tank of energy
+                continue
+            if math.hypot(rx - ncx, ry - ncy) > nr * 0.7 or not self.inside_safe(obs, rx, ry, 25):
+                continue
+            s_ = -d - math.hypot(rx - ncx, ry - ncy) * 0.3 + min(ht, 25) * 1.5
+            if s_ > best_s:
+                best, best_s = (rx, ry, top), s_
+        return best
+
+    def roof_valid(self, obs):
+        if self.roof is None:
+            return False
+        zn = obs["zone"]
+        return math.hypot(self.roof[0] - zn["next_center"][0], self.roof[1] - zn["next_center"][1]) < zn["next_radius"] * 0.8 \
+            and self.inside_safe(obs, self.roof[0], self.roof[1], 15)
 
     def hold_goal(self, obs, me, t):
         return None  # v5: corner holding off (v4 scored lower)
@@ -548,7 +594,7 @@ class Bot:
 
         # ---------- movement goals out of combat ----------
         zgoal, zurgent = self.zone_goal(obs, me)
-        if not mode.startswith(("fight", "retreat", "cover", "hold-fight")):
+        if mode != "fight" and mode != "retreat":
             goal = None
             # supply drop
             for dr in obs.get("drops", []):
@@ -688,13 +734,51 @@ class Bot:
                         self.strafe_sign *= -1
                         self.strafe_until = t + random.uniform(0.3, 0.6)
 
+        # ---------- roof camping ----------
+        climbing = False
+        if not self.roof_valid(obs) and t - self.roof_t > 2.0:
+            self.roof = self.pick_roof(obs, me)
+            self.roof_t = t
+        if self.roof is not None and not zurgent and mode not in ("drop", "capture"):
+            rx, ry, rtop = self.roof
+            rd = math.hypot(rx - x, ry - y)
+            on_roof = z > rtop - 1.0 and rd < 14
+            if on_roof:
+                # camp: stay near the middle, tiny side steps when fighting
+                ux, uy = norm2(rx - x, ry - y)
+                pull = min(1.0, rd / 4.0)
+                side = (move[0] * 0.25, move[1] * 0.25) if target else (0.0, 0.0)
+                move = (ux * pull + side[0], uy * pull + side[1])
+                if math.hypot(*move) < 0.15:
+                    move = (0.0, 0.0)
+                boost = False
+                mode = "roof-" + mode
+            elif not (target and target[2] and target[1] < 120 and hp_frac > 0.5):
+                need = (rtop - z) / 10.0 * 15.0 + 20  # energy to jet up
+                if rd < 22:
+                    if energy >= min(need, me.get("max_energy", 100) - 2) or not me["grounded"]:
+                        move = norm2(rx - x, ry - y)
+                        climbing = True
+                        if me["grounded"]:
+                            jump = True
+                        boost = energy > 3
+                        mode = "climb"
+                    else:
+                        move = (0.0, 0.0)
+                        mode = "charge-jets"
+                elif mode in ("roam", "heal", "alert", "crate", "zone") or (mode == "loot" and rd < 60):
+                    move = norm2(rx - x, ry - y)
+                    mode = "to-roof"
+
         # ---------- steering + stuck handling ----------
         mx, my = move
         moving = math.hypot(mx, my) > 0.3
         self.hist.append((t, x, y))
         while self.hist and self.hist[0][0] < t - 1.0:
             self.hist.pop(0)
-        if t < self.stuck_until and self.stuck_dir is not None:
+        if climbing or mode.startswith("roof-"):
+            self.hist = []
+        elif t < self.stuck_until and self.stuck_dir is not None:
             mx, my = self.stuck_dir
             if energy > 8:
                 boost = True
@@ -715,7 +799,7 @@ class Bot:
                         self.stuck_until = t + 1.3
                         self.hist = []
         # in the air: only jet when unsticking or climbing onto something
-        if not me["grounded"] and not (t < self.stuck_until):
+        if not me["grounded"] and not (t < self.stuck_until) and not climbing:
             boost = False
 
         # ---------- default aim: look around ----------
