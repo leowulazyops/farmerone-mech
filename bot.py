@@ -163,6 +163,8 @@ class Bot:
         self.last_dmg_t = -99.0
         self.steer_bias = 1
         self.prev_hp = None
+        self.cover = None
+        self.cover_t = -99.0
 
     # ---------- helpers ----------
     def zone_goal(self, obs, me):
@@ -208,6 +210,37 @@ class Bot:
                         self.steer_bias = sgn
                     return c, s, off_deg > 0
         return dx, dy, True
+
+    def find_cover(self, obs, me, threats):
+        """A nearby walkable spot, inside the zone, that the threats cannot see."""
+        if not self.map.ok:
+            return None
+        x, y, z = me["pos"]
+        best, best_s = None, -1e9
+        tx = sum(e[0]["pos"][0] for e in threats) / len(threats)
+        ty = sum(e[0]["pos"][1] for e in threats) / len(threats)
+        away = math.atan2(y - ty, x - tx)
+        for k in range(16):
+            a = k * TAU / 16
+            for d in (14.0, 26.0, 40.0):
+                px, py = x + math.cos(a) * d, y + math.sin(a) * d
+                gz = self.map.h(px, py)
+                if gz > z + 1.1 or gz < z - 8:
+                    continue
+                if not self.inside_safe(obs, px, py, 15):
+                    continue
+                hidden = 0
+                for e in threats:
+                    m = e[0]
+                    eye = [m["pos"][0], m["pos"][1], m["pos"][2] + 8]
+                    if not self.map.los(eye, [px, py, gz + 4.5]):
+                        hidden += 1
+                s = hidden * 100 - d * 0.6 + 25 * math.cos(wrap(a - away))
+                if s > best_s:
+                    best, best_s = (px, py, hidden), s
+        if best and best[2] > 0:
+            return best[:2]
+        return None
 
     def inside_safe(self, obs, px, py, margin=10):
         z = obs["zone"]
@@ -265,7 +298,7 @@ class Bot:
             d = dist(m)
             vis = self.map.los(muzzle, center(m))
             enemies.append((m, d, vis))
-        enemies.sort(key=lambda e: (not e[2], e[1] + e[0].get("hp", 1400) * 0.04))
+        enemies.sort(key=lambda e: (not e[2], e[1] * 0.5 + e[0].get("hp", 1400) * 0.08))
         threats = [e for e in enemies if e[1] < 240]
         target = threats[0] if threats else None
 
@@ -360,9 +393,16 @@ class Bot:
                 pref = max(pref, 65.0)
             if "mortar" in m.get("weapons", []):
                 pref = min(pref, 45.0) if light_i is not None or d < 60 else pref
-            if len([e for e in threats if e[2]]) >= 2:
+            n_vis = len([e for e in threats if e[2]])
+            if n_vis >= 2:
                 pref += 35
-            retreat = hp_frac < 0.35 or (hp_frac < 0.55 and m.get("hp", 0) > me["hp"] * 1.6)
+            elif m.get("hp", 1400) < me["hp"] * 0.8:
+                pref = min(pref, 55.0)  # winning a 1v1: press in and finish it
+            e_hp = m.get("hp", 1400)
+            if n_vis <= 1:
+                retreat = hp_frac < 0.25 or (hp_frac < 0.45 and e_hp > me["hp"] * 1.8)
+            else:
+                retreat = hp_frac < 0.5 or (hp_frac < 0.7 and n_vis >= 3)
             if retreat:
                 pref = 200.0
                 mode = "retreat"
@@ -382,6 +422,17 @@ class Bot:
                 mx += ax * w
                 my += ay * w
             move = norm2(mx, my)
+            if retreat:
+                if t - self.cover_t > 0.6:
+                    self.cover = self.find_cover(obs, me, threats)
+                    self.cover_t = t
+                if self.cover:
+                    cx_, cy_ = self.cover[0] - x, self.cover[1] - y
+                    if math.hypot(cx_, cy_) > 2.5:
+                        move = norm2(cx_, cy_)
+                    else:
+                        move = (sx * 0.3, sy * 0.3)
+                    mode = "cover"
             laser_charging = laser_i is not None and (weapons[laser_i].get("charge", 0) or 0) > 0
             boost = (energy > 55 or (retreat and energy > 15)) and not laser_charging
             if light_i is not None and d < 50 and not retreat:
@@ -494,8 +545,9 @@ class Bot:
                     if math.hypot(gx, gy) < 6:
                         move = (move[0] * 0.5, move[1] * 0.5)
             # low hp and nobody around: walk slowly (silent) to regen
-            if hp_frac < 0.6 and mode in ("roam", "crate") and not zurgent:
-                move = (move[0] * 0.4, move[1] * 0.4)
+            if hp_frac < 0.65 and mode in ("roam", "crate") and not zurgent and t - self.last_dmg_t > 2.0:
+                move = (0.0, 0.0)  # stand still: silent, and regen kicks in
+                mode = "heal"
         else:
             # in a fight the zone still wins if we are in danger
             if zgoal is not None and zurgent:
@@ -503,11 +555,12 @@ class Bot:
                 move = norm2(move[0] * 0.4 + zx * 1.2, move[1] * 0.4 + zy * 1.2)
                 boost = boost or (not me["in_zone"] and energy > 10)
 
-        # cubes very close: grab them even mid-fight
+        # cubes close by: grab them even mid-fight
         if mode in ("fight",):
+            reach_c = 35 if (len(threats) == 1 and hp_frac > 0.5) else 18
             for c_ in obs.get("cubes", []):
                 d = math.hypot(c_["pos"][0] - x, c_["pos"][1] - y)
-                if d < 20 and abs(c_["pos"][2] - z) < 4:
+                if d < reach_c and abs(c_["pos"][2] - z) < 4:
                     cx_, cy_ = norm2(c_["pos"][0] - x, c_["pos"][1] - y)
                     move = norm2(move[0] * 0.5 + cx_, move[1] * 0.5 + cy_)
                     break
@@ -600,6 +653,9 @@ class Bot:
                 base = math.atan2(my, mx) if moving else me["aim"][0]
                 aim = [wrap(base + 1.0 * math.sin(t * 1.3)), 0.0]
 
+        # empty magazine: always reload
+        if gun is not None and gun.get("ammo", 1) <= 0 and gun.get("reload", 0) <= 0:
+            act["reload"] = True
         # reload when quiet
         if gun is not None and not target and gun.get("ammo", 0) < gun["stats"].get("mag", 12) * 0.5 \
                 and gun.get("reload", 0) <= 0 and not fire[gun_i]:
