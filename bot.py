@@ -482,7 +482,7 @@ class Bot:
             # supply drop
             for dr in obs.get("drops", []):
                 d = math.hypot(dr["pos"][0] - x, dr["pos"][1] - y)
-                if d < 220 and self.inside_safe(obs, dr["pos"][0], dr["pos"][1], 20) and (
+                if d < 450 and self.inside_safe(obs, dr["pos"][0], dr["pos"][1], 20) and (
                         dr.get("holder") in (None, me["id"])):
                     if d < dr["radius"] - 2.5 and dr["lands_in"] <= 0:
                         goal = (x, y)  # stand still to capture
@@ -528,6 +528,28 @@ class Bot:
                 if best:
                     goal = (best[0]["pos"][0], best[0]["pos"][1])
                     mode = "cube"
+            # farm cubes: walk toward drones and crates we can see
+            if goal is None and hp_frac > 0.6 and not zurgent:
+                best = None
+                for n in npcs:
+                    if abs(n["pos"][2] - z) > 6 or not self.inside_safe(obs, n["pos"][0], n["pos"][1], 25):
+                        continue
+                    d = dist(n)
+                    if d < 200 and (best is None or d < best[1]):
+                        best = (n, d)
+                if best and best[1] > 55:
+                    goal = (best[0]["pos"][0], best[0]["pos"][1])
+                    mode = "hunt"
+                elif best is None:
+                    for c_ in obs.get("crates", []):
+                        if abs(c_["pos"][2] - z) > 5 or not self.inside_safe(obs, c_["pos"][0], c_["pos"][1], 25):
+                            continue
+                        d = math.hypot(c_["pos"][0] - x, c_["pos"][1] - y)
+                        if 30 < d < 160 and (best is None or d < best[1]):
+                            best = (c_, d)
+                    if best:
+                        goal = (best[0]["pos"][0], best[0]["pos"][1])
+                        mode = "crate"
             if zurgent and zgoal:
                 goal = zgoal
                 mode = "zone"
